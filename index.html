@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Content Calendar</title>
+  <style>
+    :root {
+      --bg: #f6f6f8;
+      --card: #ffffff;
+      --text: #1d1d24;
+      --muted: #6b6b78;
+      --today: #22a06b;
+      --tomorrow: #e2a400;
+      --week: #3b82f6;
+      --later: #8b8b99;
+      --past: #9aa0a6;
+      --error: #e5484d;
+      --border: #e4e4ea;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 24px 16px;
+    }
+    .wrap { max-width: 900px; margin: 0 auto; }
+    h1 { margin: 0 0 4px; font-size: 26px; }
+    .sub { color: var(--muted); margin: 0 0 20px; }
+
+    .setup {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 20px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .setup input {
+      flex: 1 1 300px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 14px;
+    }
+    button {
+      padding: 10px 16px;
+      border: none;
+      border-radius: 8px;
+      background: var(--text);
+      color: #fff;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .summary { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; }
+    .chip {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 6px 12px;
+      font-size: 13px;
+    }
+    .chip b { margin-right: 4px; }
+
+    .group { margin-bottom: 24px; }
+    .group h2, .group summary {
+      font-size: 16px;
+      font-weight: 700;
+      margin: 0 0 10px;
+      padding-left: 10px;
+      border-left: 4px solid var(--color);
+      cursor: default;
+    }
+    .group summary { cursor: pointer; }
+    .item {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--color);
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin-bottom: 8px;
+    }
+    .item .date { font-weight: 700; margin-bottom: 6px; }
+    .item .field { font-size: 14px; margin: 2px 0; word-break: break-word; white-space: pre-line; }
+    .item .field span { color: var(--muted); }
+    .item a { color: var(--week); }
+    .item.problem { border-color: var(--error); background: #fff5f5; }
+    .item.empty { color: var(--muted); font-style: italic; }
+    .warn { color: var(--error); font-size: 13px; font-weight: 600; margin-top: 6px; }
+    .msg { color: var(--muted); padding: 20px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Content Calendar</h1>
+    <p class="sub" id="todayLabel"></p>
+
+    <div class="setup">
+      <input id="sheetLink" type="url" placeholder="Paste the Google Sheet link here">
+      <button id="loadBtn">Load</button>
+    </div>
+
+    <div class="summary" id="summary"></div>
+    <div id="output"><p class="msg">Paste the Google Sheet link above and click Load.</p></div>
+  </div>
+
+  <script>
+    // ---------- 1. Settings ----------
+    const MONTHS = ["January","February","March","April","May","June",
+                    "July","August","September","October","November","December"];
+    const WEEKDAYS = ["SUNDAY","MONDAY","TUESDAY","WEDNESDAY","THURSDAY","FRIDAY","SATURDAY"];
+
+    // Her tabs are named like (OCTOBER). Change this if the naming changes.
+    const tabName = monthIndex => `(${MONTHS[monthIndex].toUpperCase()})`;
+
+    const GROUPS = [
+      { key: "problem",  label: "Needs checking", color: "var(--error)" },
+      { key: "today",    label: "Today",          color: "var(--today)" },
+      { key: "tomorrow", label: "Tomorrow",       color: "var(--tomorrow)" },
+      { key: "week",     label: "This week",      color: "var(--week)" },
+      { key: "later",    label: "Later",          color: "var(--later)" },
+      { key: "past",     label: "Past",           color: "var(--past)", collapsed: true }
+    ];
+
+    // ---------- 2. Helpers ----------
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const startOfDay = d => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+
+    function formatDate(d) {
+      return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+    }
+
+    function escapeHTML(s) {
+      return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+
+    // Make links clickable (for the Media Link column)
+    function linkify(text) {
+      return escapeHTML(text).replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank" rel="noopener">Open link</a>');
+    }
+
+    // Read CSV text into rows (handles commas and line breaks inside quotes)
+    function parseCSV(text) {
+      const rows = [];
+      let row = [], cell = "", inQuotes = false;
+      for (let i = 0; i < text.length; i++) {
+        const c = text[i], next = text[i + 1];
+        if (inQuotes) {
+          if (c === '"' && next === '"') { cell += '"'; i++; }
+          else if (c === '"') inQuotes = false;
+          else cell += c;
+        } else {
+          if (c === '"') inQuotes = true;
+          else if (c === ",") { row.push(cell); cell = ""; }
+          else if (c === "\n" || c === "\r") {
+            if (c === "\r" && next === "\n") i++;
+            row.push(cell); rows.push(row); row = []; cell = "";
+          } else cell += c;
+        }
+      }
+      if (cell !== "" || row.length) { row.push(cell); rows.push(row); }
+      return rows.map(r => r.map(v => v.trim()));
+    }
+
+    // Get the sheet ID from a normal Google Sheets link
+    function getSheetId(url) {
+      const m = url.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+      return m && m[1] !== "e" ? m[1] : null;
+    }
+
+    // ---------- 3. Read one month tab ----------
+    async function fetchTab(sheetId, month, year) {
+      const name = tabName(month);
+      const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&headers=0&sheet=${encodeURIComponent(name)}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("not shared");
+      const text = await res.text();
+      if (text.trim().startsWith("<")) throw new Error("not shared");
+      return parseTab(parseCSV(text), month, year);
+    }
+
+    function parseTab(rows, month, year) {
+      // Safety check: if the tab title says a different month, skip it
+      const titleRow = rows.slice(0, 5).flat().join(" ");
+      const titleMatch = titleRow.match(new RegExp(`(${MONTHS.join("|")})\\s+(\\d{4})`, "i"));
+      if (titleMatch && titleMatch[1].toLowerCase() !== MONTHS[month].toLowerCase()) return [];
+      if (titleMatch) year = +titleMatch[2];
+
+      // Find the DAY column (the one full of WEDNESDAY, THURSDAY...)
+      const width = Math.max(...rows.map(r => r.length));
+      let dayCol = -1, best = 0;
+      for (let c = 0; c < width; c++) {
+        const count = rows.filter(r => WEEKDAYS.includes((r[c] || "").toUpperCase())).length;
+        if (count > best) { best = count; dayCol = c; }
+      }
+      if (dayCol < 1) return [];
+      const dateCol = dayCol - 1;
+
+      // Find the header row (the one with DATE / DAY / CONTENT TYPE)
+      let headerRow = rows.findIndex(r => /content type/i.test(r.join(" ")) || (r[dayCol] || "").toUpperCase() === "DAY");
+      if (headerRow === -1) headerRow = 0;
+      const headers = rows[headerRow].map((h, i) => h || `Column ${i + 1}`);
+
+      const items = [];
+      rows.slice(headerRow + 1).forEach(r => {
+        const dayNum = parseInt(r[dateCol], 10);
+        if (!dayNum || dayNum < 1 || dayNum > 31) return;
+
+        const date = new Date(year, month, dayNum);
+        const fields = headers
+          .map((h, i) => ({ label: h, value: r[i] || "" }))
+          .filter((f, i) => i !== dateCol && i !== dayCol && i > dateCol && f.value);
+
+        items.push({
+          date,
+          dayWritten: (r[dayCol] || "").toUpperCase(),
+          fields,
+          hasContent: fields.length > 0,
+          problems: []
+        });
+      });
+      return items;
+    }
+
+    // ---------- 4. Load this month + next month ----------
+    async function loadSheet(url) {
+      const out = document.getElementById("output");
+      const sheetId = getSheetId(url);
+      if (!sheetId) {
+        out.innerHTML = `<p class="msg">⚠ That doesn't look like a Google Sheet link. Copy it from the address bar of the sheet.</p>`;
+        return;
+      }
+      out.innerHTML = `<p class="msg">Loading...</p>`;
+
+      const now = new Date();
+      const thisMonth = { month: now.getMonth(), year: now.getFullYear() };
+      const nextMonth = now.getMonth() === 11
+        ? { month: 0, year: now.getFullYear() + 1 }
+        : { month: now.getMonth() + 1, year: now.getFullYear() };
+
+      const results = await Promise.allSettled([
+        fetchTab(sheetId, thisMonth.month, thisMonth.year),
+        fetchTab(sheetId, nextMonth.month, nextMonth.year)
+      ]);
+
+      if (results.every(r => r.status === "rejected")) {
+        out.innerHTML = `<p class="msg">⚠ Couldn't open the sheet. In Google Sheets, click Share and set General access to "Anyone with the link" (Viewer).</p>`;
+        return;
+      }
+
+      const items = results.filter(r => r.status === "fulfilled").flatMap(r => r.value);
+      if (!items.length) {
+        out.innerHTML = `<p class="msg">⚠ No ${tabName(thisMonth.month)} or ${tabName(nextMonth.month)} tab found. Check the tab names.</p>`;
+        return;
+      }
+
+      try { localStorage.setItem("sheetLink", url); } catch (e) {}
+      checkAndGroup(items);
+    }
+
+    // ---------- 5. Find mistakes and sort into groups ----------
+    function checkAndGroup(items) {
+      const today = startOfDay(new Date());
+
+      // Count the same content appearing on more than one date
+      const contentKey = it => it.fields.map(f => f.value.toLowerCase()).join("|");
+      const counts = {};
+      items.filter(it => it.hasContent).forEach(it => {
+        const k = contentKey(it);
+        counts[k] = (counts[k] || 0) + 1;
+      });
+
+      items.forEach(it => {
+        // Wrong day name next to the date
+        const realDay = WEEKDAYS[it.date.getDay()];
+        if (it.dayWritten && it.dayWritten !== realDay) {
+          it.problems.push(`Day says ${it.dayWritten} but this date is a ${realDay}`);
+        }
+        if (it.hasContent && counts[contentKey(it)] > 1) {
+          it.problems.push("Same content is listed on another date");
+        }
+
+        const diff = Math.round((it.date - today) / DAY_MS);
+        if (diff < 0) it.group = "past";
+        else if (diff === 0) it.group = "today";
+        else if (diff === 1) it.group = "tomorrow";
+        else if (diff <= 7) it.group = "week";
+        else it.group = "later";
+
+        if (it.problems.length && diff >= 0) it.group = "problem";
+      });
+
+      items.sort((a, b) => a.date - b.date);
+      render(items, today);
+    }
+
+    // ---------- 6. Show on the page ----------
+    function render(items, today) {
+      const out = document.getElementById("output");
+      const summary = document.getElementById("summary");
+      out.innerHTML = "";
+      summary.innerHTML = "";
+
+      GROUPS.forEach(g => {
+        let list = items.filter(i => i.group === g.key);
+
+        // Today and Tomorrow always show, even when empty
+        const alwaysShow = g.key === "today" || g.key === "tomorrow";
+        const withContent = list.filter(i => i.hasContent || i.problems.length);
+        if (!withContent.length && !alwaysShow) return;
+        if (!alwaysShow) list = withContent;
+
+        summary.innerHTML += `<div class="chip"><b>${withContent.length}</b>${g.label}</div>`;
+
+        const cards = list.length ? list.map(it => {
+          if (!it.hasContent && !it.problems.length) {
+            return `<div class="item empty"><div class="date">${formatDate(it.date)}</div>Nothing scheduled</div>`;
+          }
+          const fields = it.fields.map(f =>
+            `<div class="field"><span>${escapeHTML(f.label)}:</span> ${linkify(f.value)}</div>`).join("");
+          const warn = it.problems.length ? `<div class="warn">⚠ ${it.problems.join(" · ")}</div>` : "";
+          return `<div class="item ${it.problems.length ? "problem" : ""}">
+                    <div class="date">${formatDate(it.date)}</div>${fields}${warn}</div>`;
+        }).join("") : `<div class="item empty">No posting slot on the calendar</div>`;
+
+        const section = document.createElement(g.collapsed ? "details" : "div");
+        section.className = "group";
+        section.style.setProperty("--color", g.color);
+        section.innerHTML = g.collapsed
+          ? `<summary>${g.label} (${withContent.length})</summary>${cards}`
+          : `<h2>${g.label}</h2>${cards}`;
+        out.appendChild(section);
+      });
+    }
+
+    // ---------- 7. Buttons ----------
+    document.getElementById("todayLabel").textContent = "Today is " + formatDate(new Date());
+
+    document.getElementById("loadBtn").addEventListener("click", () => {
+      const url = document.getElementById("sheetLink").value.trim();
+      if (url) loadSheet(url);
+    });
+
+    // Remember the last link so she only pastes it once
+    try {
+      const saved = localStorage.getItem("sheetLink");
+      if (saved) {
+        document.getElementById("sheetLink").value = saved;
+        loadSheet(saved);
+      }
+    } catch (e) {}
+  </script>
+</body>
+</html>
